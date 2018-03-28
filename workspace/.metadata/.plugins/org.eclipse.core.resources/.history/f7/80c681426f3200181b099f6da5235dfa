@@ -1,0 +1,331 @@
+//////////////////////////////////////////////////////////////////////////////
+// *
+// * Predmetni projekat iz predmeta OAiS DSP 2
+// * Godina: 2018
+// *
+// * Zadatak: Ekvalizacija audio signala
+// * Autor: Savo Dragovic
+// * Indeks: RA117-2015
+// * Grupa: 34
+// *
+/////////////////////////////////////////////////////////////////////////////
+
+#include "stdio.h"
+#include "stdlib.h"
+#include "ezdsp5535.h"
+#include "ezdsp5535_i2c.h"
+#include "aic3204.h"
+#include "ezdsp5535_aic3204_dma.h"
+#include "ezdsp5535_i2s.h"
+#include "ezdsp5535_sar.h"
+#include "print_number.h"
+#include "math.h"
+#include <string.h>
+
+#include "iir.h"
+#include "processing.h"
+
+/* Frekvencija odabiranja */
+#define SAMPLE_RATE 16000L
+
+#define PI 3.14159265
+#define alpha_LP 0.3
+#define alpha_HP -0.3
+#define alpha_Peek 0.7
+#define beta_Peek 0
+#define MAX_IMPULSE 16000
+#define k1 8192
+#define k2 24576
+
+/* Niz za smestanje ulaznih i izlaznih odbiraka */
+#pragma DATA_ALIGN(sampleBufferL,4)
+Int16 sampleBufferL[AUDIO_IO_SIZE];
+#pragma DATA_ALIGN(sampleBufferR,4)
+Int16 sampleBufferR[AUDIO_IO_SIZE];
+
+// shelving_LP odbirci za k1 i Bass
+#pragma DATA_ALIGN(shelvingLP_bufferL1,4)
+Int16 shelvingLP_bufferL1[AUDIO_IO_SIZE];
+#pragma DATA_ALIGN(shelvingLP_bufferR1,4)
+Int16 shelvingLP_bufferR1[AUDIO_IO_SIZE];
+
+// shelving_LP odbirci za k2 i Ekvalizator
+#pragma DATA_ALIGN(shelvingLP_bufferL2,4)
+Int16 shelvingLP_bufferL2[AUDIO_IO_SIZE];
+#pragma DATA_ALIGN(shelvingLP_bufferR2,4)
+Int16 shelvingLP_bufferR2[AUDIO_IO_SIZE];
+
+// shelving_Peek odbirci za k1 i Treble
+#pragma DATA_ALIGN(shelvingHP_bufferL1,4)
+Int16 shelvingHP_bufferL1[AUDIO_IO_SIZE];
+#pragma DATA_ALIGN(shelvingHP_bufferR1,4)
+Int16 shelvingHP_bufferR1[AUDIO_IO_SIZE];
+
+// shelving_Peek odbirci za k2 i Ekvalizator
+#pragma DATA_ALIGN(shelvingHP_bufferL2,4)
+Int16 shelvingHP_bufferL2[AUDIO_IO_SIZE];
+#pragma DATA_ALIGN(shelvingHP_bufferR2,4)
+Int16 shelvingHP_bufferR2[AUDIO_IO_SIZE];
+
+// shelving_Peek odbirci za k1 i Mid1
+#pragma DATA_ALIGN(shelvingPeek_bufferL1,4)
+Int16 shelvingPeek_bufferL1[AUDIO_IO_SIZE];
+#pragma DATA_ALIGN(shelvingPeek_bufferR1,4)
+Int16 shelvingPeek_bufferR1[AUDIO_IO_SIZE];
+
+// shelving_Peek odbirci za k2 i Mid2
+#pragma DATA_ALIGN(shelvingPeek_bufferL2,4)
+Int16 shelvingPeek_bufferL2[AUDIO_IO_SIZE];
+#pragma DATA_ALIGN(shelvingPeek_bufferR2,4)
+Int16 shelvingPeek_bufferR2[AUDIO_IO_SIZE];
+
+// shelving_Peek odbirci za Ekvalizator (Mid1)
+#pragma DATA_ALIGN(shelvingPeek_buffer_mid1L,4)
+Int16 shelvingPeek_buffer_mid1L[AUDIO_IO_SIZE];
+#pragma DATA_ALIGN(shelvingPeek_buffer_mid1R,4)
+Int16 shelvingPeek_buffer_mid1R[AUDIO_IO_SIZE];
+
+// shelving_Peek odbirci za Ekvalizator (Mid2)
+#pragma DATA_ALIGN(shelvingPeek_buffer_mid2L,4)
+Int16 shelvingPeek_buffer_mid2L[AUDIO_IO_SIZE];
+#pragma DATA_ALIGN(shelvingPeek_buffer_mid2R,4)
+Int16 shelvingPeek_buffer_mid2R[AUDIO_IO_SIZE];
+
+
+//dirakov impuls signal
+#pragma DATA_ALIGN(dirac_impulse,4)
+Int16 dirac_impulse[AUDIO_IO_SIZE];
+
+// Nizovi za smestanje koeficijenata all_pass filtera (prvog i drugog reda)
+Int16 coeffs_iir_first_LP[4];
+Int16 coeffs_iir_first_LP_custom[4];
+Int16 coeffs_iir_first_HP[4];
+Int16 coeffs_iir_first_HP_custom[4];
+Int16 coeffs_iir_second_Peek[6];
+Int16 coeffs_iir_second_Peek_custom1[6];
+Int16 coeffs_iir_second_Peek_custom2[6];
+
+// nizovi koji predstavljaju history buffer
+Int16 x_historyL[2];
+Int16 y_historyL[2];
+Int16 x_historyR[2];
+Int16 y_historyR[2];
+
+// podopsezi koeficijenata K (SW1 -> odedjuje koji je K, SW2 -> umanjuje zadati K za 3277)
+static Int16 K[4] = {16000, 16000, 16000, 16000};
+
+// indeks koeficijenta K iz niza
+int index = 0;
+
+// koeficijenti dobijeni iz skripte (skripta.py)
+float alpha[4] = {0.9243904917414228, 0.8851142730421002, 0.6074120553201985, -0.1583844392205828};
+float beta[2] = {0.9767658813737635, 0.44346231577045125};
+
+// stanja  (za SW1)
+enum SWITCH_STATE{BASS, MID1, MID2, TREBLE};
+
+
+Uint16 getKey() {
+    static Uint16 old = NoKey;
+    Uint16 key = EZDSP5535_SAR_getKey();
+    if (key == old) {
+        return NoKey;
+    } else {
+        old = key;
+        return key;
+    }
+}
+
+
+void main( void )
+{   
+    /* Inicijalizaija razvojne ploce */
+    EZDSP5535_init( );
+
+    /* Inicijalizacija kontrolera za ocitavanje vrednosti pritisnutog dugmeta*/
+    EZDSP5535_SAR_init();
+
+    /* Inicijalizacija LCD kontrolera */
+    initPrintNumber();
+
+	printf("\n Ekvalizacija audio signala \n");
+		
+    /* Inicijalizacija veze sa AIC3204 kodekom (AD/DA) */
+    aic3204_hardware_init();
+	
+    /* Inicijalizacija AIC3204 kodeka */
+	aic3204_init();
+
+    aic3204_dma_init();
+    
+    /* Postavljanje vrednosti frekvencije odabiranja i pojacanja na kodeku */
+    set_sampling_frequency_and_gain(SAMPLE_RATE, 0);
+
+    // pravljenje dirakovog impulsa
+    int i;
+
+    for (i = 0; i < AUDIO_IO_SIZE; i++) {
+    	dirac_impulse[i] = (i == 0) ? MAX_IMPULSE : 0;
+    }
+
+    //racunanje koeficijenata za all_pass filtere
+    calculateShelvingCoeff(alpha_LP, coeffs_iir_first_LP);
+    calculateShelvingCoeff(alpha_HP, coeffs_iir_first_HP);
+    calculatePeekCoeff(alpha_Peek, beta_Peek, coeffs_iir_second_Peek);
+
+    //racunanje koeficijenata za all_pass filtere koje je izracunato u skripti
+    calculateShelvingCoeff(alpha[0], coeffs_iir_first_LP_custom);
+    calculatePeekCoeff(alpha[1], beta[0], coeffs_iir_second_Peek_custom1);
+    calculatePeekCoeff(alpha[2], beta[1], coeffs_iir_second_Peek_custom2);
+    calculateShelvingCoeff(alpha[3], coeffs_iir_first_HP_custom);
+
+
+    /* shelving filter LP */
+
+		// for k1 impulse_responce
+			shelvingLP(dirac_impulse, shelvingLP_bufferL1, AUDIO_IO_SIZE, coeffs_iir_first_LP, x_historyL, y_historyL, k1);
+			shelvingLP(dirac_impulse, shelvingLP_bufferR1, AUDIO_IO_SIZE, coeffs_iir_first_LP, x_historyR, y_historyR, k1);
+
+			memset(shelvingLP_bufferL1, 0, AUDIO_IO_SIZE*sizeof(Int16));
+			memset(shelvingLP_bufferR1, 0, AUDIO_IO_SIZE*sizeof(Int16));
+
+		// for k2 impulse_responce
+			shelvingLP(dirac_impulse, shelvingLP_bufferL2, AUDIO_IO_SIZE, coeffs_iir_first_LP, x_historyL, y_historyL, k2);
+			shelvingLP(dirac_impulse, shelvingLP_bufferR2, AUDIO_IO_SIZE, coeffs_iir_first_LP, x_historyR, y_historyR, k2);
+
+			memset(shelvingLP_bufferL2, 0, AUDIO_IO_SIZE*sizeof(Int16));
+			memset(shelvingLP_bufferR2, 0, AUDIO_IO_SIZE*sizeof(Int16));
+
+
+	/* shelving filter HP */
+
+		// for k1 impulse_responce
+			shelvingHP(dirac_impulse, shelvingHP_bufferL1, AUDIO_IO_SIZE, coeffs_iir_first_HP, x_historyL, y_historyL, k1);
+			shelvingHP(dirac_impulse, shelvingHP_bufferR1, AUDIO_IO_SIZE, coeffs_iir_first_HP, x_historyR, y_historyR, k1);
+
+			memset(shelvingHP_bufferL1, 0, AUDIO_IO_SIZE*sizeof(Int16));
+			memset(shelvingHP_bufferR1, 0, AUDIO_IO_SIZE*sizeof(Int16));
+
+		// for k2 impulse_responce
+			shelvingHP(dirac_impulse, shelvingHP_bufferL2, AUDIO_IO_SIZE, coeffs_iir_first_HP, x_historyL, y_historyL, k2);
+			shelvingHP(dirac_impulse, shelvingHP_bufferR2, AUDIO_IO_SIZE, coeffs_iir_first_HP, x_historyR, y_historyR, k2);
+
+			memset(shelvingHP_bufferL2, 0, AUDIO_IO_SIZE*sizeof(Int16));
+			memset(shelvingHP_bufferR2, 0, AUDIO_IO_SIZE*sizeof(Int16));
+
+
+	/* shelving filter Peek */
+
+		// for k1 impulse_responce
+			shelvingPeek(dirac_impulse, shelvingPeek_bufferL1, AUDIO_IO_SIZE, coeffs_iir_second_Peek, x_historyL, y_historyL, k1);
+			shelvingPeek(dirac_impulse, shelvingPeek_bufferR1, AUDIO_IO_SIZE, coeffs_iir_second_Peek, x_historyR, y_historyR, k1);
+
+			memset(shelvingPeek_bufferL1, 0, AUDIO_IO_SIZE*sizeof(Int16));
+			memset(shelvingPeek_bufferR1, 0, AUDIO_IO_SIZE*sizeof(Int16));
+
+		// for k2 impulse_responce
+			shelvingPeek(dirac_impulse, shelvingPeek_bufferL2, AUDIO_IO_SIZE, coeffs_iir_second_Peek, x_historyL, y_historyL, k2);
+			shelvingPeek(dirac_impulse, shelvingPeek_bufferR2, AUDIO_IO_SIZE, coeffs_iir_second_Peek, x_historyR, y_historyR, k2);
+
+			memset(shelvingPeek_bufferL2, 0, AUDIO_IO_SIZE*sizeof(Int16));
+			memset(shelvingPeek_bufferR2, 0, AUDIO_IO_SIZE*sizeof(Int16));
+
+	// promenljiva koja nam saopstava koji podopseg se obradjuje
+
+    clearLCD();
+
+    while(1)
+    {
+    	aic3204_read_block(sampleBufferL, sampleBufferR);
+
+    	/* Your code here */
+
+    	// ocitavanje stanja pritisnutog tastera
+    	Uint16 key = getKey();
+
+    	switch(key) {
+
+    		case SW1:
+    			index = (index + 1) % 4;
+    			setWritePointerToFirstChar();
+    			printChar(index + '0');
+    			printChar('0' + K[index] / 3277);
+
+    		break;
+
+    		case SW2:
+    			K[index]-= 3277;
+    				if (K[index] < 0) {
+    					K[index] = 32767;
+    				}
+
+    			setWritePointerToFirstChar();
+    			printChar(index + '0');
+    			printChar('0' + K[index] / 3277);
+
+    		break;
+
+    	}
+
+    	setWritePointerToFirstChar();
+
+				/* Bass impulse - test */
+
+					// for K[index] impulse_responce
+						shelvingLP(dirac_impulse, shelvingLP_bufferL1, AUDIO_IO_SIZE, coeffs_iir_first_LP_custom, x_historyL, y_historyL, K[index]);
+						shelvingLP(dirac_impulse, shelvingLP_bufferR1, AUDIO_IO_SIZE, coeffs_iir_first_LP_custom, x_historyR, y_historyR, K[index]);
+
+				/* Mid1 impulse - test */
+
+					// for K[index] impulse_responce
+						shelvingPeek(dirac_impulse, shelvingPeek_bufferL1, AUDIO_IO_SIZE, coeffs_iir_second_Peek_custom1, x_historyL, y_historyL, K[index]);
+						shelvingPeek(dirac_impulse, shelvingPeek_bufferR1, AUDIO_IO_SIZE, coeffs_iir_second_Peek_custom1, x_historyR, y_historyR, K[index]);
+
+
+				/* Mid2 impulse - test */
+
+					// for K[index] impulse_responce
+						shelvingPeek(dirac_impulse, shelvingPeek_bufferL2, AUDIO_IO_SIZE, coeffs_iir_second_Peek_custom2, x_historyL, y_historyL, K[index]);
+						shelvingPeek(dirac_impulse, shelvingPeek_bufferR2, AUDIO_IO_SIZE, coeffs_iir_second_Peek_custom2, x_historyR, y_historyR, K[index]);
+
+
+				/* Treble impulse - test */
+
+					// for K[index] impulse_responce
+						shelvingHP(dirac_impulse, shelvingHP_bufferL1, AUDIO_IO_SIZE, coeffs_iir_first_HP_custom, x_historyL, y_historyL, K[index]);
+						shelvingHP(dirac_impulse, shelvingHP_bufferR1, AUDIO_IO_SIZE, coeffs_iir_first_HP_custom, x_historyR, y_historyR, K[index]);
+
+
+
+    	/* Ekvalizator */
+
+    		// Bass
+    			shelvingLP(sampleBufferL, shelvingLP_bufferL2, AUDIO_IO_SIZE, coeffs_iir_first_LP_custom, x_historyL, y_historyL, K[index]);
+    			shelvingLP(sampleBufferR, shelvingLP_bufferR2, AUDIO_IO_SIZE, coeffs_iir_first_LP_custom, x_historyR, y_historyR, K[index]);
+    		// Mid1
+    			shelvingPeek(shelvingLP_bufferL2, shelvingPeek_buffer_mid1L, AUDIO_IO_SIZE, coeffs_iir_second_Peek_custom1, x_historyL, y_historyL, K[index]);
+    			shelvingPeek(shelvingLP_bufferR2, shelvingPeek_buffer_mid1R, AUDIO_IO_SIZE, coeffs_iir_second_Peek_custom1, x_historyR, y_historyR, K[index]);
+    		// Mid2
+    			shelvingPeek(shelvingPeek_buffer_mid1L, shelvingPeek_buffer_mid2L, AUDIO_IO_SIZE, coeffs_iir_second_Peek_custom2, x_historyL, y_historyL, K[index]);
+    			shelvingPeek(shelvingPeek_buffer_mid1R, shelvingPeek_buffer_mid2R, AUDIO_IO_SIZE, coeffs_iir_second_Peek_custom2, x_historyR, y_historyR, K[index]);
+    		// Treble
+    			shelvingHP(shelvingPeek_buffer_mid2L, shelvingHP_bufferL2, AUDIO_IO_SIZE, coeffs_iir_first_HP_custom, x_historyL, y_historyL, K[index]);
+    			shelvingHP(shelvingPeek_buffer_mid2R, shelvingHP_bufferR2, AUDIO_IO_SIZE, coeffs_iir_first_HP_custom, x_historyR, y_historyR, K[index]);
+
+    		/* U shelvingHP_bufferL2 (shelvingHP_bufferR2) se nalazi konacan izlaz iz ekvalizatora */
+
+
+
+    	aic3204_write_block(sampleBufferR, sampleBufferR);
+
+    }
+
+
+    /* Prekid veze sa AIC3204 kodekom */
+    aic3204_disable();
+
+    printf( "\n***Kraj programa***\n" );
+    SW_BREAKPOINT;
+}
+
+
